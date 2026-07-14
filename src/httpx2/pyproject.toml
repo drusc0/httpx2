@@ -57,7 +57,7 @@ brotli = [
     "brotlicffi; platform_python_implementation != 'CPython'",
 ]
 cli = [
-    "click==8.*",
+    "click>=8.4",
     "pygments==2.*",
     "rich>=10,<16",
 ]
@@ -66,6 +66,9 @@ http2 = [
 ]
 socks = [
     "socksio==1.*",
+]
+ws = [
+    "wsproto>=1.2",
 ]
 # TODO(Marcelo): Remove when Python 3.13 reaches EOL.
 zstd = [
