@@ -38,6 +38,87 @@ class HTTPConnectionState(enum.IntEnum):
     CLOSED = 3
 
 
+def _merge_duplicate_chunked_transfer_encoding(header_block: bytes) -> bytes:
+    """
+    Merge exact-duplicate `Transfer-Encoding: chunked` header lines into one.
+
+    Some servers send this redundant duplicate on the wire (see
+    https://github.com/pydantic/httpx2/issues/622). h11 already tolerates
+    duplicate `Content-Length` headers so long as every value is identical;
+    this mirrors that same narrow tolerance for `Transfer-Encoding`. Any
+    other case (differing values, non-`chunked` duplicates) is left
+    untouched, so h11 still raises for it exactly as before.
+    """
+    status_line, *header_lines = header_block.split(b"\r\n")
+
+    seen_chunked_transfer_encoding = False
+    merged_lines = []
+    for line in header_lines:
+        name, sep, value = line.partition(b":")
+        if sep and name.strip().lower() == b"transfer-encoding" and value.strip().lower() == b"chunked":
+            if seen_chunked_transfer_encoding:
+                continue
+            seen_chunked_transfer_encoding = True
+        merged_lines.append(line)
+
+    return b"\r\n".join([status_line, *merged_lines])
+
+
+class HTTP11ResponseNormalizingStream(NetworkStream):
+    """
+    Wraps the underlying network stream and, while a response's headers are
+    still being received, normalizes them via `_merge_duplicate_chunked_transfer_encoding`
+    before h11 ever sees the bytes. Once the header block is found (or
+    `max_buffer_size` is exceeded without finding it), reads pass straight
+    through unmodified for the rest of that response cycle.
+    """
+
+    def __init__(self, stream: NetworkStream, max_buffer_size: int) -> None:
+        self._stream = stream
+        self._max_buffer_size = max_buffer_size
+        self._buffer: bytes | None = b""
+
+    def reset(self) -> None:
+        self._buffer = b""
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if self._buffer is None:
+            return self._stream.read(max_bytes, timeout)
+
+        while True:
+            chunk = self._stream.read(max_bytes, timeout)
+            if not chunk:
+                return chunk
+
+            self._buffer += chunk
+            header_block, separator, rest = self._buffer.partition(b"\r\n\r\n")
+            if separator:
+                self._buffer = None
+                return _merge_duplicate_chunked_transfer_encoding(header_block) + separator + rest
+
+            if len(self._buffer) > self._max_buffer_size:
+                buffered = self._buffer
+                self._buffer = None
+                return buffered
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self._stream.write(buffer, timeout)
+
+    def close(self) -> None:
+        self._stream.close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> NetworkStream:
+        return self._stream.start_tls(ssl_context, server_hostname, timeout)
+
+    def get_extra_info(self, info: str) -> typing.Any:
+        return self._stream.get_extra_info(info)
+
+
 class HTTP11Connection(ConnectionInterface):
     READ_NUM_BYTES = 64 * 1024
     MAX_INCOMPLETE_EVENT_SIZE = 100 * 1024
@@ -49,7 +130,7 @@ class HTTP11Connection(ConnectionInterface):
         keepalive_expiry: float | None = None,
     ) -> None:
         self._origin = origin
-        self._network_stream = stream
+        self._network_stream = HTTP11ResponseNormalizingStream(stream, self.MAX_INCOMPLETE_EVENT_SIZE)
         self._keepalive_expiry: float | None = keepalive_expiry
         self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
@@ -102,7 +183,7 @@ class HTTP11Connection(ConnectionInterface):
                     headers,
                 )
 
-            network_stream = self._network_stream
+            network_stream: NetworkStream = self._network_stream
 
             # CONNECT or Upgrade request
             if (status == 101) or ((request.method == b"CONNECT") and (200 <= status < 300)):
@@ -221,6 +302,7 @@ class HTTP11Connection(ConnectionInterface):
             if self._h11_state.our_state is h11.DONE and self._h11_state.their_state is h11.DONE:
                 self._state = HTTPConnectionState.IDLE
                 self._h11_state.start_next_cycle()
+                self._network_stream.reset()
                 if self._keepalive_expiry is not None:
                     now = time.monotonic()
                     self._expire_at = now + self._keepalive_expiry
