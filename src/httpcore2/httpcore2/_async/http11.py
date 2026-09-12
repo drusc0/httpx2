@@ -74,13 +74,19 @@ def _merge_duplicate_chunked_transfer_encoding(header_block: bytes) -> bytes:
     Any other case (differing values, folded lines, malformed lines) is left
     completely untouched, so h11 still raises for it exactly as before.
 
-    Never applies if the header block also contains anything resembling a
-    `Content-Length` header (a deliberately broad, case-insensitive substring
-    check, not a precise parse). `Transfer-Encoding` combined with
+    Never applies if the header block also contains a `Content-Length`
+    header: every `\n`-split line's field name (the part before the first
+    `:`, matched case-insensitively, not stripped of whitespace -- same
+    reasoning as the `Transfer-Encoding` match above) is checked against
+    `content-length` exactly. `Transfer-Encoding` combined with
     `Content-Length` is exactly the shape of the classic conflicting-framing
     request-smuggling primitive that RFC 9112 requires treating as an error;
     issue #622's actual reproductions never combine the two, so giving up the
-    merge here costs nothing while closing off that class of ambiguity.
+    merge here costs nothing while closing off that class of ambiguity. Like
+    the `Transfer-Encoding` match, this doesn't account for obsolete line
+    folding, so a `Content-Length` header expressed only via a folded
+    continuation line won't be detected -- an accepted, narrow gap, since an
+    undetected fold is left untouched either way (see above).
     """
     if any(line.partition(b":")[0].lower() == b"content-length" for line in header_block.split(b"\n")):
         return header_block
