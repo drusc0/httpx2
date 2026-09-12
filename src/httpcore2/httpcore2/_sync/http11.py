@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 import ssl
 import time
 import types
@@ -38,85 +39,87 @@ class HTTPConnectionState(enum.IntEnum):
     CLOSED = 3
 
 
+# Mirrors h11's own header/body boundary (`h11._receivebuffer.blank_line_regex`):
+# h11 tolerates a bare `\n` or `\n\r\n`, not just `\r\n\r\n`.
+_HEADER_BLOCK_TERMINATOR_RE = re.compile(rb"\n\r?\n")
+
+
 def _merge_duplicate_chunked_transfer_encoding(header_block: bytes) -> bytes:
     """
-    Merge exact-duplicate `Transfer-Encoding: chunked` header lines into one.
+    Merge an exact-duplicate `Transfer-Encoding: chunked` header line into an
+    earlier one, mirroring h11's existing tolerance for duplicate identical
+    Content-Length headers (see https://github.com/pydantic/httpx2/issues/622).
 
-    Some servers send this redundant duplicate on the wire (see
-    https://github.com/pydantic/httpx2/issues/622). h11 already tolerates
-    duplicate `Content-Length` headers so long as every value is identical;
-    this mirrors that same narrow tolerance for `Transfer-Encoding`. Any
-    other case (differing values, non-`chunked` duplicates) is left
-    untouched, so h11 still raises for it exactly as before.
+    `header_block` must end with the header/body boundary matched by
+    `_HEADER_BLOCK_TERMINATOR_RE`, boundary bytes included. Lines are split
+    the same way h11 splits them (on `\n`, with one optional trailing `\r`
+    stripped per line -- see `h11._receivebuffer.ReceiveBuffer.maybe_extract_lines`)
+    so a header block using non-`\r\n` line endings is parsed identically to
+    how h11 will parse it.
+
+    Only ever *removes* bytes that are provably an exact, unfolded repeat of
+    an earlier `Transfer-Encoding: chunked` line:
+
+    - Header names are matched case-insensitively (legitimate per RFC 9110),
+      but never stripped of surrounding whitespace -- a real header field has
+      no whitespace between the name and the colon, so anything like
+      `Transfer-Encoding : chunked` fails to match and is left for h11 to
+      reject as an illegal header line.
+    - A candidate line is skipped entirely if it starts with a fold-indicating
+      space/tab (RFC 9112 obsolete line folding: it's a continuation of the
+      *previous* header's value, not a standalone header) or if the following
+      line does -- in the latter case deleting it would orphan that
+      continuation, changing which header it folds into.
+
+    Any other case (differing values, folded lines, malformed lines) is left
+    completely untouched, so h11 still raises for it exactly as before.
     """
-    status_line, *header_lines = header_block.split(b"\r\n")
+    line_spans: list[tuple[bytes, int, int]] = []
+    start = 0
+    for match in re.finditer(rb"\n", header_block):
+        end = match.end()
+        content_end = match.start()
+        if header_block[content_end - 1 : content_end] == b"\r":
+            content_end -= 1
+        line_spans.append((header_block[start:content_end], start, end))
+        start = end
+
+    # The final span is always the second half of the header/body boundary
+    # itself (mirroring h11's own `del lines[-2:]`), never a real header line.
+    header_line_spans = line_spans[:-1]
 
     seen_chunked_transfer_encoding = False
-    merged_lines = []
-    for line in header_lines:
-        name, sep, value = line.partition(b":")
-        if sep and name.strip().lower() == b"transfer-encoding" and value.strip().lower() == b"chunked":
-            if seen_chunked_transfer_encoding:
-                continue
+    delete_spans: list[tuple[int, int]] = []
+    for index, (content, span_start, span_end) in enumerate(header_line_spans):
+        if index == 0:
+            continue  # the status line
+
+        if content[:1] in (b" ", b"\t"):
+            continue  # obsolete-line-fold continuation of the previous line
+
+        next_content = header_line_spans[index + 1][0] if index + 1 < len(header_line_spans) else b""
+        if next_content[:1] in (b" ", b"\t"):
+            continue  # this line has its own fold continuation; leave it alone
+
+        name, sep, value = content.partition(b":")
+        if not (sep and name.lower() == b"transfer-encoding" and value.strip(b" \t").lower() == b"chunked"):
+            continue
+
+        if seen_chunked_transfer_encoding:
+            delete_spans.append((span_start, span_end))
+        else:
             seen_chunked_transfer_encoding = True
-        merged_lines.append(line)
 
-    return b"\r\n".join([status_line, *merged_lines])
+    if not delete_spans:
+        return header_block
 
-
-class HTTP11ResponseNormalizingStream(NetworkStream):
-    """
-    Wraps the underlying network stream and, while a response's headers are
-    still being received, normalizes them via `_merge_duplicate_chunked_transfer_encoding`
-    before h11 ever sees the bytes. Once the header block is found (or
-    `max_buffer_size` is exceeded without finding it), reads pass straight
-    through unmodified for the rest of that response cycle.
-    """
-
-    def __init__(self, stream: NetworkStream, max_buffer_size: int) -> None:
-        self._stream = stream
-        self._max_buffer_size = max_buffer_size
-        self._buffer: bytes | None = b""
-
-    def reset(self) -> None:
-        self._buffer = b""
-
-    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        if self._buffer is None:
-            return self._stream.read(max_bytes, timeout)
-
-        while True:
-            chunk = self._stream.read(max_bytes, timeout)
-            if not chunk:
-                return chunk
-
-            self._buffer += chunk
-            header_block, separator, rest = self._buffer.partition(b"\r\n\r\n")
-            if separator:
-                self._buffer = None
-                return _merge_duplicate_chunked_transfer_encoding(header_block) + separator + rest
-
-            if len(self._buffer) > self._max_buffer_size:
-                buffered = self._buffer
-                self._buffer = None
-                return buffered
-
-    def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        self._stream.write(buffer, timeout)
-
-    def close(self) -> None:
-        self._stream.close()
-
-    def start_tls(
-        self,
-        ssl_context: ssl.SSLContext,
-        server_hostname: str | None = None,
-        timeout: float | None = None,
-    ) -> NetworkStream:
-        return self._stream.start_tls(ssl_context, server_hostname, timeout)
-
-    def get_extra_info(self, info: str) -> typing.Any:
-        return self._stream.get_extra_info(info)
+    merged = bytearray()
+    cursor = 0
+    for delete_start, delete_end in delete_spans:
+        merged += header_block[cursor:delete_start]
+        cursor = delete_end
+    merged += header_block[cursor:]
+    return bytes(merged)
 
 
 class HTTP11Connection(ConnectionInterface):
@@ -130,7 +133,7 @@ class HTTP11Connection(ConnectionInterface):
         keepalive_expiry: float | None = None,
     ) -> None:
         self._origin = origin
-        self._network_stream = HTTP11ResponseNormalizingStream(stream, self.MAX_INCOMPLETE_EVENT_SIZE)
+        self._network_stream = stream
         self._keepalive_expiry: float | None = keepalive_expiry
         self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
@@ -140,6 +143,18 @@ class HTTP11Connection(ConnectionInterface):
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
         )
+        # Accumulates bytes for the response header block currently being
+        # assembled, so they can be normalized (see
+        # `_merge_duplicate_chunked_transfer_encoding`) before h11 sees them.
+        # Only ever appended to while `self._h11_state.their_state` is
+        # `h11.SEND_RESPONSE` -- see `_receive_event`.
+        self._response_header_buffer = b""
+        # Bytes already read from the network that logically belong to
+        # whatever comes *after* the header block just flushed above (e.g. a
+        # 1xx interim response's own headers, followed immediately by the
+        # final response's headers in the same read) -- reprocessed through
+        # the same logic before another real network read is attempted.
+        self._pending_read_ahead = b""
 
     def handle_request(self, request: Request) -> Response:
         if not self.can_handle_request(request.url.origin):
@@ -183,7 +198,7 @@ class HTTP11Connection(ConnectionInterface):
                     headers,
                 )
 
-            network_stream: NetworkStream = self._network_stream
+            network_stream = self._network_stream
 
             # CONNECT or Upgrade request
             if (status == 101) or ((request.method == b"CONNECT") and (200 <= status < 300)):
@@ -257,7 +272,16 @@ class HTTP11Connection(ConnectionInterface):
         # raw header casing, rather than the enforced lowercase headers.
         headers = event.headers.raw_items()
 
-        trailing_data, _ = self._h11_state.trailing_data
+        # `_pending_read_ahead` may hold bytes read alongside this response's
+        # headers that h11 was never given (see `_receive_event`) -- e.g. the
+        # leading bytes of an upgraded protocol, read in the same chunk as
+        # the 101 response's own headers. Combine it with h11's own
+        # (separately-tracked) trailing data, the same non-destructive read
+        # in both cases: for an ordinary response, this value is unused by
+        # the caller and `_pending_read_ahead` is left intact for
+        # `_receive_response_body`'s own `_receive_event` calls to drain.
+        h11_trailing_data, _ = self._h11_state.trailing_data
+        trailing_data = h11_trailing_data + self._pending_read_ahead
 
         return http_version, event.status_code, event.reason, headers, trailing_data
 
@@ -278,21 +302,71 @@ class HTTP11Connection(ConnectionInterface):
                 event = self._h11_state.next_event()
 
             if event is h11.NEED_DATA:
-                data = self._network_stream.read(self.READ_NUM_BYTES, timeout=timeout)
+                if self._pending_read_ahead:
+                    # Bytes already read that belong to whatever comes next
+                    # (see `_pending_read_ahead`'s docstring in `__init__`) --
+                    # reprocess those before touching the network again.
+                    data, self._pending_read_ahead = self._pending_read_ahead, b""
+                else:
+                    data = self._network_stream.read(self.READ_NUM_BYTES, timeout=timeout)
 
-                # If we feed this case through h11 we'll raise an exception like:
-                #
-                #     httpcore2.RemoteProtocolError: can't handle event type
-                #     ConnectionClosed when role=SERVER and state=SEND_RESPONSE
-                #
-                # Which is accurate, but not very informative from an end-user
-                # perspective. Instead we handle this case distinctly and treat
-                # it as a ConnectError.
-                if data == b"" and self._h11_state.their_state == h11.SEND_RESPONSE:
-                    msg = "Server disconnected without sending a response."
-                    raise RemoteProtocolError(msg)
+                    # If we feed this case through h11 we'll raise an exception
+                    # like:
+                    #
+                    #     httpcore2.RemoteProtocolError: can't handle event type
+                    #     ConnectionClosed when role=SERVER and state=SEND_RESPONSE
+                    #
+                    # Which is accurate, but not very informative from an
+                    # end-user perspective. Instead we handle this case
+                    # distinctly and treat it as a ConnectError.
+                    if data == b"" and self._h11_state.their_state == h11.SEND_RESPONSE:
+                        msg = "Server disconnected without sending a response."
+                        raise RemoteProtocolError(msg)
 
-                self._h11_state.receive_data(data)
+                if self._h11_state.their_state != h11.SEND_RESPONSE or (
+                    not self._response_header_buffer and self._h11_state.trailing_data[0]
+                ):
+                    # Either not currently receiving a response's
+                    # status-line/headers (e.g. mid-body) -- nothing to
+                    # normalize, feed it straight through as before.
+                    #
+                    # Or: we're about to *start* accumulating a new header
+                    # block, but h11 is already sitting on unparsed bytes of
+                    # its own (e.g. a pipelined response, or the tail end of
+                    # a previous cycle that arrived in the same read as this
+                    # one). Our boundary search only looks inside our own
+                    # buffer, so if the real header/body boundary straddles
+                    # that hidden junction, searching this new data alone
+                    # could lock onto a later, coincidental match -- inside
+                    # the response body -- and corrupt it. Bail out of
+                    # normalizing this response rather than risk that; h11
+                    # still handles the duplicate-header case exactly as it
+                    # did before this fix existed.
+                    self._h11_state.receive_data(data)
+                else:
+                    self._response_header_buffer += data
+                    match = _HEADER_BLOCK_TERMINATOR_RE.search(self._response_header_buffer)
+                    if match is not None:
+                        header_block = self._response_header_buffer[: match.end()]
+                        # Whatever follows is held back rather than fed to h11
+                        # here -- it may be another header block (an interim
+                        # response ahead of the final one) that still needs
+                        # its own normalization pass, which the top of this
+                        # loop will give it once h11 asks for more data.
+                        self._pending_read_ahead = self._response_header_buffer[match.end() :]
+                        self._response_header_buffer = b""
+                        self._h11_state.receive_data(_merge_duplicate_chunked_transfer_encoding(header_block))
+                    elif len(self._response_header_buffer) > self.MAX_INCOMPLETE_EVENT_SIZE:
+                        # No boundary within the size bound h11 itself enforces
+                        # -- stop buffering and let h11 apply its own limit.
+                        buffered = self._response_header_buffer
+                        self._response_header_buffer = b""
+                        self._h11_state.receive_data(buffered)
+                    # else: boundary not found yet -- loop back without
+                    # feeding h11 anything (and without touching
+                    # `_pending_read_ahead`, which stays empty); `next_event()`
+                    # will return NEED_DATA again, and since there's still no
+                    # read-ahead to drain, this reads the network for more.
             else:
                 # mypy fails to narrow the type in the above if statement above
                 return event  # type: ignore[return-value]
@@ -302,7 +376,6 @@ class HTTP11Connection(ConnectionInterface):
             if self._h11_state.our_state is h11.DONE and self._h11_state.their_state is h11.DONE:
                 self._state = HTTPConnectionState.IDLE
                 self._h11_state.start_next_cycle()
-                self._network_stream.reset()
                 if self._keepalive_expiry is not None:
                     now = time.monotonic()
                     self._expire_at = now + self._keepalive_expiry

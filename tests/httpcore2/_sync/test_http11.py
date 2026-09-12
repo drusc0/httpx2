@@ -423,6 +423,148 @@ def test_http11_connection_with_oversized_headers_and_no_terminator() -> None:
 
 
 
+def test_http11_connection_merges_duplicate_transfer_encoding_with_lf_terminated_headers() -> None:
+    """
+    h11 tolerates bare `\\n` (not just `\\r\\n`) as a header line ending, so
+    the merge must recognize the header/body boundary and split lines the
+    same way h11 does, not assume `\\r\\n` throughout.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            b"HTTP/1.1 200 OK\n",
+            b"Content-Type: text/plain\n",
+            b"Transfer-Encoding: chunked\n",
+            b"Transfer-Encoding: chunked\n",
+            b"\n",
+            b"5\r\nHello\r\n0\r\n\r\n",
+        ]
+    )
+    with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello"
+
+        transfer_encodings = [v for k, v in response.headers if k.lower() == b"transfer-encoding"]
+        assert transfer_encodings == [b"chunked"]
+
+
+
+def test_http11_connection_merges_duplicate_transfer_encoding_after_interim_response() -> None:
+    """
+    A `100 Continue` (or other 1xx) response ahead of the final response must
+    not disable normalization for the final response's own headers.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n",
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n0\r\n\r\n",
+        ]
+    )
+    with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "GET",
+            "https://example.com/",
+            headers={"Expect": "continue"},
+        )
+        assert response.status == 200
+        assert response.content == b"Hello"
+
+        transfer_encodings = [v for k, v in response.headers if k.lower() == b"transfer-encoding"]
+        assert transfer_encodings == [b"chunked"]
+
+
+
+def test_http11_connection_merges_duplicate_transfer_encoding_after_interim_response_same_read() -> None:
+    """
+    Same as above, but the interim response and the final response's headers
+    arrive in a single network read together -- h11 doesn't need another
+    `NEED_DATA` round trip to see the final response's headers, so they must
+    still get normalized even though no further data is read from the
+    network in between.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n\r\n"
+            b"HTTP/1.1 200 OK\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"5\r\nHello\r\n0\r\n\r\n"
+        ]
+    )
+    with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "GET",
+            "https://example.com/",
+            headers={"Expect": "continue"},
+        )
+        assert response.status == 200
+        assert response.content == b"Hello"
+
+        transfer_encodings = [v for k, v in response.headers if k.lower() == b"transfer-encoding"]
+        assert transfer_encodings == [b"chunked"]
+
+
+
+def test_http11_connection_does_not_merge_transfer_encoding_with_space_before_colon() -> None:
+    """
+    `Transfer-Encoding : chunked` (space before the colon) is not the same
+    raw header line as `Transfer-Encoding: chunked` -- it's illegal per the
+    header-field grammar. It must not be treated as an equivalent duplicate;
+    h11 should still see it and reject the message.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Transfer-Encoding : chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n0\r\n\r\n",
+        ]
+    )
+    with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            conn.request("GET", "https://example.com/")
+
+
+
+def test_http11_connection_does_not_merge_obsolete_line_folded_transfer_encoding() -> None:
+    """
+    Obsolete line folding (RFC 7230 3.2.4) means a header line starting with
+    whitespace is a *continuation* of the previous header's value, not a
+    standalone header. A folded line that happens to read
+    `Transfer-Encoding: chunked` must never be treated as a duplicate to
+    merge away -- doing so would delete part of an unrelated header's value
+    and let an otherwise-invalid message through. h11 must still see the
+    fold and reject the message exactly as it would unpatched.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"X-Cache: HIT\r\n",
+            b" Transfer-Encoding: chunked\r\n",
+            b"Content-Length: 5\r\n",
+            b" Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"Hello",
+        ]
+    )
+    with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            conn.request("GET", "https://example.com/")
+
+
+
 def test_http11_header_sub_100kb() -> None:
     """
     A connection should be able to handle a http header size up to 100kB.
