@@ -403,6 +403,31 @@ def test_http11_connection_with_conflicting_transfer_encoding_headers() -> None:
 
 
 
+def test_http11_connection_does_not_merge_transfer_encoding_alongside_content_length() -> None:
+    """
+    `Transfer-Encoding` combined with `Content-Length` is exactly the shape
+    of the classic conflicting-framing request-smuggling primitive, so the
+    merge must never apply when a `Content-Length` header is also present --
+    even though the duplicate `Transfer-Encoding` lines are themselves
+    byte-identical -- leaving h11 to reject the message as before.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 46\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n0\r\n\r\n",
+        ]
+    )
+    with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            conn.request("GET", "https://example.com/")
+
+
+
 def test_http11_connection_with_oversized_headers_and_no_terminator() -> None:
     """
     If the header block never terminates and grows past the incomplete-event
@@ -557,6 +582,30 @@ def test_http11_connection_does_not_merge_obsolete_line_folded_transfer_encoding
             b" Transfer-Encoding: chunked\r\n",
             b"\r\n",
             b"Hello",
+        ]
+    )
+    with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore2.RemoteProtocolError):
+            conn.request("GET", "https://example.com/")
+
+
+
+def test_http11_connection_does_not_merge_obsolete_line_folded_transfer_encoding_without_content_length() -> None:
+    """
+    Same fold-continuation hazard as above, but without a `Content-Length`
+    header present, so this exercises the fold-continuation skip in
+    `_merge_duplicate_chunked_transfer_encoding` directly rather than via
+    the (separate) `Content-Length` bail-out.
+    """
+    origin = httpcore2.Origin(b"https", b"example.com", 443)
+    stream = httpcore2.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b" Transfer-Encoding: chunked\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b" folded-continuation\r\n",
+            b"\r\n",
+            b"",
         ]
     )
     with httpcore2.HTTP11Connection(origin=origin, stream=stream) as conn:

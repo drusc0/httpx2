@@ -73,7 +73,18 @@ def _merge_duplicate_chunked_transfer_encoding(header_block: bytes) -> bytes:
 
     Any other case (differing values, folded lines, malformed lines) is left
     completely untouched, so h11 still raises for it exactly as before.
+
+    Never applies if the header block also contains anything resembling a
+    `Content-Length` header (a deliberately broad, case-insensitive substring
+    check, not a precise parse). `Transfer-Encoding` combined with
+    `Content-Length` is exactly the shape of the classic conflicting-framing
+    request-smuggling primitive that RFC 9112 requires treating as an error;
+    issue #622's actual reproductions never combine the two, so giving up the
+    merge here costs nothing while closing off that class of ambiguity.
     """
+    if b"content-length" in header_block.lower():
+        return header_block
+
     line_spans: list[tuple[bytes, int, int]] = []
     start = 0
     for match in re.finditer(rb"\n", header_block):
@@ -147,8 +158,19 @@ class HTTP11Connection(ConnectionInterface):
         # assembled, so they can be normalized (see
         # `_merge_duplicate_chunked_transfer_encoding`) before h11 sees them.
         # Only ever appended to while `self._h11_state.their_state` is
-        # `h11.SEND_RESPONSE` -- see `_receive_event`.
-        self._response_header_buffer = b""
+        # `h11.SEND_RESPONSE` -- see `_receive_event`. A `bytearray` (not
+        # `bytes`) so repeated `+=` don't reallocate-and-copy the whole thing
+        # each time.
+        self._response_header_buffer = bytearray()
+        # How far into `_response_header_buffer` the terminator search has
+        # already ruled out a match, so each new read only rescans the tail
+        # instead of the whole accumulated buffer -- mirrors h11's own
+        # `ReceiveBuffer._multiple_lines_search` (see its module docstring:
+        # "reading short segments out of a long buffer MUST be O(bytes read)
+        # to avoid DoS issues"). The terminator is at most 3 bytes, so it's
+        # always safe to resume 2 bytes before the end of what's already
+        # been scanned.
+        self._response_header_search_from = 0
         # Bytes already read from the network that logically belong to
         # whatever comes *after* the header block just flushed above (e.g. a
         # 1xx interim response's own headers, followed immediately by the
@@ -345,28 +367,38 @@ class HTTP11Connection(ConnectionInterface):
                     self._h11_state.receive_data(data)
                 else:
                     self._response_header_buffer += data
-                    match = _HEADER_BLOCK_TERMINATOR_RE.search(self._response_header_buffer)
+                    match = _HEADER_BLOCK_TERMINATOR_RE.search(
+                        self._response_header_buffer, self._response_header_search_from
+                    )
                     if match is not None:
-                        header_block = self._response_header_buffer[: match.end()]
+                        header_block = bytes(self._response_header_buffer[: match.end()])
                         # Whatever follows is held back rather than fed to h11
                         # here -- it may be another header block (an interim
                         # response ahead of the final one) that still needs
                         # its own normalization pass, which the top of this
                         # loop will give it once h11 asks for more data.
-                        self._pending_read_ahead = self._response_header_buffer[match.end() :]
-                        self._response_header_buffer = b""
+                        self._pending_read_ahead = bytes(self._response_header_buffer[match.end() :])
+                        self._response_header_buffer = bytearray()
+                        self._response_header_search_from = 0
                         self._h11_state.receive_data(_merge_duplicate_chunked_transfer_encoding(header_block))
                     elif len(self._response_header_buffer) > self.MAX_INCOMPLETE_EVENT_SIZE:
                         # No boundary within the size bound h11 itself enforces
                         # -- stop buffering and let h11 apply its own limit.
-                        buffered = self._response_header_buffer
-                        self._response_header_buffer = b""
+                        buffered = bytes(self._response_header_buffer)
+                        self._response_header_buffer = bytearray()
+                        self._response_header_search_from = 0
                         self._h11_state.receive_data(buffered)
-                    # else: boundary not found yet -- loop back without
-                    # feeding h11 anything (and without touching
-                    # `_pending_read_ahead`, which stays empty); `next_event()`
-                    # will return NEED_DATA again, and since there's still no
-                    # read-ahead to drain, this reads the network for more.
+                    else:
+                        # Boundary not found yet -- loop back without feeding
+                        # h11 anything (and without touching
+                        # `_pending_read_ahead`, which stays empty); next_event()
+                        # will return NEED_DATA again, and since there's still
+                        # no read-ahead to drain, this reads the network for
+                        # more. The terminator is at most 3 bytes, so the next
+                        # search can safely skip everything except the last 2
+                        # bytes already scanned -- without this, accumulating
+                        # a large header block byte-by-byte is O(n^2).
+                        self._response_header_search_from = max(0, len(self._response_header_buffer) - 2)
             else:
                 # mypy fails to narrow the type in the above if statement above
                 return event  # type: ignore[return-value]
