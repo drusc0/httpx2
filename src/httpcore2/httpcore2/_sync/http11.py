@@ -82,7 +82,7 @@ def _merge_duplicate_chunked_transfer_encoding(header_block: bytes) -> bytes:
     issue #622's actual reproductions never combine the two, so giving up the
     merge here costs nothing while closing off that class of ambiguity.
     """
-    if b"content-length" in header_block.lower():
+    if any(line.partition(b":")[0].lower() == b"content-length" for line in header_block.split(b"\n")):
         return header_block
 
     line_spans: list[tuple[bytes, int, int]] = []
