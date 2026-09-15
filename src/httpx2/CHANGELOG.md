@@ -8,9 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-* Mask any password component of the request URL in `httpx2` INFO log output and in
-  `repr(Request)`, matching the existing `repr(URL)` behaviour, so that credentials
-  embedded in a URL are no longer written to logs.
+* Mask any password component of the request URL in `httpx2` INFO log output, in
+  `repr(Request)`, and in `HTTPStatusError` messages raised by `raise_for_status()`,
+  matching the existing `repr(URL)` behaviour, so that credentials embedded in a URL
+  are no longer written to logs or exception messages.
   ([#767](https://github.com/pydantic/httpx2/issues/767))
 
 ## 2.13.0 (September 14th, 2026)

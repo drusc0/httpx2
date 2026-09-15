@@ -149,6 +149,23 @@ def test_raise_for_status() -> None:
         response.raise_for_status()
 
 
+def test_raise_for_status_does_not_leak_url_credentials() -> None:
+    request = httpx2.Request("GET", "https://user:s3kr3t@example.org")
+
+    response = httpx2.Response(404, request=request)
+    with pytest.raises(httpx2.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    assert "s3kr3t" not in str(exc_info.value)
+    assert "user:[secure]@example.org" in str(exc_info.value)
+
+    headers = {"location": "https://other.org"}
+    response = httpx2.Response(303, headers=headers, request=request)
+    with pytest.raises(httpx2.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    assert "s3kr3t" not in str(exc_info.value)
+    assert "user:[secure]@example.org" in str(exc_info.value)
+
+
 def test_response_repr() -> None:
     response = httpx2.Response(
         200,
