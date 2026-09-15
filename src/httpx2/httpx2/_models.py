@@ -509,7 +509,7 @@ class Request:
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        url = str(self.url)
+        url = self.url._masked_str()
         return f"<{class_name}({self.method!r}, {url!r})>"
 
     def __getstate__(self) -> dict[str, typing.Any]:
