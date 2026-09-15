@@ -24,6 +24,7 @@ from ._decoders import (
 from ._exceptions import (
     CookieConflict,
     HTTPStatusError,
+    InvalidURL,
     RequestNotRead,
     ResponseNotRead,
     StreamClosed,
@@ -803,10 +804,22 @@ class Response:
         if self.is_success:
             return self
 
+        masked_location = ""
         if self.has_redirect_location:
+            location = self.headers["location"]
+            try:
+                # Mask any credentials in the redirect target too, in case a
+                # malicious or misconfigured server redirects to a URL carrying
+                # a Basic Auth userinfo component.
+                masked_location = URL(location)._masked_str()
+            except InvalidURL:
+                # Relative locations have no userinfo to mask, and malformed
+                # ones aren't real URLs to begin with either way - fall back to
+                # the raw header value, matching the pre-existing behaviour.
+                masked_location = location
             message = (
                 "{error_type} '{0.status_code} {0.reason_phrase}' for url '{masked_url}'\n"
-                "Redirect location: '{0.headers[location]}'\n"
+                "Redirect location: '{masked_location}'\n"
                 "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{0.status_code}"
             )
         else:
@@ -823,7 +836,9 @@ class Response:
             5: "Server error",
         }
         error_type = error_types.get(status_class, "Invalid status code")
-        message = message.format(self, error_type=error_type, masked_url=self.url._masked_str())
+        message = message.format(
+            self, error_type=error_type, masked_url=self.url._masked_str(), masked_location=masked_location
+        )
         raise HTTPStatusError(message, request=request, response=self)
 
     def json(self, **kwargs: typing.Any) -> typing.Any:
