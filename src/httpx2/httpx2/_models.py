@@ -813,10 +813,9 @@ class Response:
                 # a Basic Auth userinfo component.
                 masked_location = URL(location)._masked_str()
             except InvalidURL:
-                # Relative locations have no userinfo to mask, and malformed
-                # ones aren't real URLs to begin with either way - fall back to
-                # the raw header value, matching the pre-existing behaviour.
-                masked_location = location
+                # A malformed location can still carry userinfo (e.g. an invalid
+                # host), so redact the password from the raw header value.
+                masked_location = re.sub(r"(//[^/?#:@]*):[^/?#]*@", r"\1:[secure]@", location)
             message = (
                 "{error_type} '{0.status_code} {0.reason_phrase}' for url '{masked_url}'\n"
                 "Redirect location: '{masked_location}'\n"
