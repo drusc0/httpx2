@@ -61,6 +61,9 @@ def test_request_attribute() -> None:
     assert exc.request == request
 
 
+_SENSITIVE_VALUES = (b"s3cr3t-token", b"s3cr3t-cookie", b"s3cr3t-password", b"s3cr3t-set-cookie", b"4111111111111111")
+
+
 def _sensitive_request() -> httpx2.Request:
     return httpx2.Request(
         "POST",
@@ -99,7 +102,7 @@ def test_pickle_does_not_leak_request_data(exc_class: type[httpx2.RequestError])
     exc = exc_class("Something went wrong", request=request)
 
     pickled = pickle.dumps(exc)
-    for secret in (b"s3cr3t-token", b"s3cr3t-cookie", b"s3cr3t-password", b"4111111111111111"):
+    for secret in _SENSITIVE_VALUES:
         assert secret not in pickled
 
     restored = pickle.loads(pickled)
@@ -115,7 +118,7 @@ def test_pickle_http_status_error_does_not_leak_request_or_response_data() -> No
     exc = httpx2.HTTPStatusError("Server error", request=request, response=response)
 
     pickled = pickle.dumps(exc)
-    for secret in (b"s3cr3t-token", b"s3cr3t-cookie", b"s3cr3t-password", b"s3cr3t-set-cookie", b"4111111111111111"):
+    for secret in _SENSITIVE_VALUES:
         assert secret not in pickled
 
     # Prior to the fix, HTTPStatusError couldn't even survive a pickle round-trip,
