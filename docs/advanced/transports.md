@@ -175,23 +175,27 @@ class HelloWorldTransport(httpx2.BaseTransport):
         return httpx2.Response(200, json={"text": "Hello, world!"})
 ```
 
-Or this example, which uses a custom transport and `httpx2.Mounts` to always redirect `http://` requests.
+Or this example, which uses a custom transport and the `mounts` argument to always redirect `http://` requests.
 
 ```python
 class HTTPSRedirect(httpx2.BaseTransport):
     """
     A transport that always redirects to HTTPS.
     """
+
     def handle_request(self, request):
         url = request.url.copy_with(scheme="https")
         return httpx2.Response(303, headers={"Location": str(url)})
 
+
 # A client where any `http` requests are always redirected to `https`
-transport = httpx2.Mounts({
-    'http://': HTTPSRedirect()
-    'https://': httpx2.HTTPTransport()
-})
-client = httpx2.Client(transport=transport)
+client = httpx2.Client(
+    mounts={
+        "http://": HTTPSRedirect(),
+        "https://": httpx2.HTTPTransport(),
+    },
+    follow_redirects=True,
+)
 ```
 
 A useful pattern here is custom transport classes that wrap the default HTTP implementation. For example...
